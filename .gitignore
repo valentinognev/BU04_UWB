@@ -1,0 +1,53 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# --- IDE / editor ---
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Agent scratch (keep .c sources, drop local binaries) ---
+brain/**/scratch/*
+!brain/**/scratch/*.c
+
+# --- Reference assets (vendor PDFs, zips, firmware, CAD — keep markdown notes) ---
+Refs/*.pdf
+Refs/*.zip
+Refs/*.hex
+Refs/*.PcbDoc
+Refs/*.pcbdoc
+
+# Nested firmware SDK has its own git repo
+Refs/STM32F103-BU0x_SDK/
+
+# --- Logs / local dumps ---
+*.log
