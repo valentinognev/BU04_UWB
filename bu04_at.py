@@ -57,6 +57,8 @@ GETDEV_RE = re.compile(
 )
 INIT_FAILED_RE = re.compile(r"INIT FAILED", re.IGNORECASE)
 SETCFG_OK_RE = re.compile(r"setcfg ID:\d+,\s*Role:\d+", re.IGNORECASE)
+GETVER_LINE_RE = re.compile(r"getver\s+software:\S+", re.IGNORECASE)
+GETUWBMODE_LINE_RE = re.compile(r"twr_pdoa_mode:\s*\d+", re.IGNORECASE)
 RESPONSE_OK_RE = re.compile(r"(?:^|\r|\n)OK(?:\r|\n|$)", re.IGNORECASE | re.MULTILINE)
 FAIL_LINE_RE = re.compile(r"(?:^|\r|\n)(?:ERR|ERROR)(?:\r|\n|$)", re.IGNORECASE | re.MULTILINE)
 
@@ -147,20 +149,42 @@ class Bu04Device:
         return self.read_text(wait)
 
     @staticmethod
+    def _has_vendor_payload(text: str) -> bool:
+        if SETCFG_OK_RE.search(text):
+            return True
+        if GETVER_LINE_RE.search(text):
+            return True
+        if GETCFG_RE.search(text):
+            return True
+        if GETUWBMODE_LINE_RE.search(text):
+            return True
+        if GETDEV_RE.search(text):
+            return True
+        if PDOAGETCFG_RE.search(text):
+            return True
+        if DISTANCE_RE.search(text):
+            return True
+        return False
+
+    @staticmethod
     def _response_complete(text: str) -> bool:
-        if SETCFG_OK_RE.search(text) and RESPONSE_OK_RE.search(text):
+        if SETCFG_OK_RE.search(text) and (
+            RESPONSE_OK_RE.search(text) or Bu04Device._has_vendor_payload(text)
+        ):
             return True
-        if "GETCFG" in text.upper() and RESPONSE_OK_RE.search(text):
-            return True
-        if "GETVER" in text.upper() and RESPONSE_OK_RE.search(text):
-            return True
-        if "GETDEV" in text.upper() and RESPONSE_OK_RE.search(text):
-            return True
-        if "GETUWBMODE" in text.upper() and RESPONSE_OK_RE.search(text):
-            return True
-        if "PDOAGETCFG" in text.upper() or "tcfg Dlist:" in text:
-            return True
-        if "distance:" in text.lower() and RESPONSE_OK_RE.search(text):
+        if GETVER_LINE_RE.search(text):
+            if RESPONSE_OK_RE.search(text):
+                return True
+            if re.search(r"getver\s+software:V\d+\.\d+\.\d+", text, re.IGNORECASE):
+                return True
+            return False
+        if GETCFG_RE.search(text):
+            if RESPONSE_OK_RE.search(text):
+                return True
+            if not text.rstrip().endswith(","):
+                return True
+            return False
+        if PDOAGETCFG_RE.search(text):
             return True
         if RESPONSE_OK_RE.search(text) and not FAIL_LINE_RE.search(text):
             return True
@@ -221,7 +245,9 @@ class Bu04Device:
             return False
         if FAIL_LINE_RE.search(response):
             return False
-        return bool(RESPONSE_OK_RE.search(response))
+        if RESPONSE_OK_RE.search(response):
+            return True
+        return Bu04Device._has_vendor_payload(response)
 
     def has_init_failed(self) -> bool:
         response = self.read_available(0.5)
@@ -229,11 +255,14 @@ class Bu04Device:
 
     def ping(self) -> bool:
         _, ok = self.command_ok("AT")
-        return ok
+        if ok:
+            return True
+        # Factory V1.0.0 often returns nothing for bare AT; GETVER still works.
+        return self.get_version() is not None
 
     def get_version(self) -> str | None:
-        response, ok = self.command_ok("AT+GETVER")
-        if not ok:
+        response = self.send("AT+GETVER", wait=2.0)
+        if not self.response_ok(response):
             return None
         match = re.search(r"software:([^\s]+)", response, re.IGNORECASE)
         return match.group(1) if match else response
@@ -246,22 +275,35 @@ class Bu04Device:
         return int(match.group(1)) if match else None
 
     def get_role_config(self) -> RoleConfig | None:
-        response, ok = self.command_ok("AT+GETCFG")
-        if not ok:
-            return None
-        match = GETCFG_RE.search(response)
-        if not match:
-            return None
-        return RoleConfig(
-            device_id=int(match.group("device_id")),
-            role=int(match.group("role")),
-            channel=int(match.group("channel")),
-            rate=int(match.group("rate")),
-        )
+        for attempt in range(3):
+            response = self.send("AT+GETCFG", wait=2.0)
+            match = GETCFG_RE.search(response)
+            if match:
+                return RoleConfig(
+                    device_id=int(match.group("device_id")),
+                    role=int(match.group("role")),
+                    channel=int(match.group("channel")),
+                    rate=int(match.group("rate")),
+                )
+            if attempt < 2:
+                time.sleep(0.5)
+                self.drain(0.3)
+        return None
 
     def set_role_config(self, device_id: int, role: int, channel: int = 1, rate: int = 1) -> tuple[str, bool]:
         response = self.send(f"AT+SETCFG={device_id},{role},{channel},{rate}", wait=2.0)
-        ok = bool(SETCFG_OK_RE.search(response) and RESPONSE_OK_RE.search(response))
+        ok = bool(
+            SETCFG_OK_RE.search(response)
+            and (RESPONSE_OK_RE.search(response) or self._has_vendor_payload(response))
+        )
+        if not ok and RESPONSE_OK_RE.search(response):
+            role_cfg = self.get_role_config()
+            ok = (
+                role_cfg is not None
+                and role_cfg.role == role
+                and role_cfg.device_id == device_id
+                and role_cfg.channel == channel
+            )
         return response, ok
 
     @staticmethod
@@ -372,6 +414,10 @@ class Bu04Device:
             return setcfg_response, False
 
         role_cfg = self.get_role_config()
+        if role_cfg is None or role_cfg.role != role or role_cfg.device_id != device_id:
+            time.sleep(0.5)
+            self.drain(0.3)
+            role_cfg = self.get_role_config()
         if role_cfg is None or role_cfg.role != role or role_cfg.device_id != device_id:
             return (
                 f"SETCFG did not stick in RAM before SAVE: {role_cfg!r} "

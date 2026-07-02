@@ -22,6 +22,7 @@
 #include "uwb.h"
 
 extern void tag_start (void);
+static int cmd_fn_apply_rng_offset_mm (int dist_mm);
 extern volatile uint8_t uwb_ranging_active;  /* defined in stm32f10x_it.c */
 extern volatile uint8_t tag_bootstrap_pending; /* defined in tag_bootstrap.c */
 extern volatile uint32_t tag_bootstrap_count;
@@ -403,6 +404,7 @@ void f_stream_distance (void)
     }
 
     dist_mm = (int) (distance * 1000.0f + 0.5f);
+    dist_mm = cmd_fn_apply_rng_offset_mm (dist_mm);
     if (dist_mm < 0)
     {
         dist_mm = 0;
@@ -973,6 +975,16 @@ int f_testoled (int opt, int argc, char* argv[])
 }
 
 float distance = 0;
+
+/* AT+RNGOFF stores rngOffset_mm in NVM; apply it here so AT+DISTANCE and the
+ * streamed "distance:" line report the calibrated range. */
+static int cmd_fn_apply_rng_offset_mm (int dist_mm)
+{
+    int16_t offset_mm = (app.pConfig != NULL) ? app.pConfig->s.s_pdoa.rngOffset_mm : 0;
+    int corrected_mm = dist_mm + (int) offset_mm;
+    return (corrected_mm < 0) ? 0 : corrected_mm;
+}
+
 /*
  *  ????????
  *
@@ -984,6 +996,7 @@ int f_distance (int opt, int argc, char* argv[])
     memset (str, 0, sizeof (str));
 
     dist_mm = (int) (distance * 1000.0f + 0.5f);
+    dist_mm = cmd_fn_apply_rng_offset_mm (dist_mm);
     if (dist_mm < 0)
     {
         dist_mm = 0;

@@ -60,6 +60,8 @@ make flash-vendor-refs-all   # flash vendor hex from ../Refs/ (both modules)
 | `openocd-common.cfg` | Shared SWD; `gdb_port disabled` |
 | `openocd-anchor.cfg` | Anchor ST-Link (serial-based) |
 | `openocd-tag.cfg` | Tag ST-Link (USB path-based) |
+| `openocd-anchor-daplink.cfg` | Anchor DAPLink CMSIS-DAP (`/dev/ttyACM0`) |
+| `openocd-tag-daplink.cfg` | Tag DAPLink CMSIS-DAP (`/dev/ttyACM1`) |
 | `openocd.cfg` | Default → anchor |
 
 Tag flash uses a special boot path (`OPENOCD_TAG_BOOT`) when `reset halt` fails — see Makefile comments.
@@ -97,6 +99,15 @@ Tag --[Final 0x1c, 110 B STS]--> Anchor  →  anchor computes distance
 - Range is computed on the **anchor** (responder).
 - `node_twr_output_user()` / `f_stream_distance()` emit `distance:` (mm).
 - Tag `cb:0` in stream is normal when range is anchor-side only.
+
+### Calibration offset application (V1.0.47+)
+
+| NVM field | AT command | Applied in | Formula |
+|-----------|------------|------------|---------|
+| `rngOffset_mm` | `AT+RNGOFF` | `user_out.c` (`Tag_Addr:`), `cmd_fn.c` (`AT+DISTANCE`, `distance:` stream) | `reported_mm = raw_mm + rngOffset_mm` |
+| `pdoaOffset_deg` | `AT+PDOAOFF` | `user_out.c` (`Tag_Addr:` angle) | `reported_deg = raw_deg - pdoaOffset_deg` |
+
+Prior to the V1.0.47 fix, `rngOffset_mm` was stored in NVM but never subtracted from reported range — `AT+RNGOFF` had no effect on `Tag_Addr:` or `AT+DISTANCE` output.
 
 ### PDOA path
 
@@ -138,7 +149,7 @@ From `Makefile` `LDFLAGS`:
 - `port_set_dw_ic_spi_slowrate` / `port_set_dw_ic_spi_fastrate` — SPI wrapper
 - TWR callbacks (`twr_tx_tag_cb`, `twr_rx_tag_cb`, `twr_tx_node_cb`, `twr_rx_node_cb`, timeout/error) — diagnostics in `twr_diag.c`
 
-**Note:** Wrap counters (`ptx`, `prx`, `nrx`, `ntx`) are unreliable when the real symbol is defined inside `tag.o`/`node.o`. Use `cb`, `rlen`, `l13`, `rh` instead.
+**Note:** Wrap counters (`ptx`, `prx`, `nrx`, `ntx`) are unreliable when the real symbol is defined inside `tag.o`/`node.o`. Stream fields `rlen`, `l13`, `pol`, `rsp`, `rh` come from `uwb_snapshot_rx_meta()`, which is **not currently called** — they stay at 0. Use `rxg`/`rxf`/`rxt`/`rxe` (from `uwb_status_sample()`) and `Tag_Addr:` output instead.
 
 ---
 
@@ -146,9 +157,9 @@ From `Makefile` `LDFLAGS`:
 
 | File | Role |
 |------|------|
-| `Components/APP/cmd_fn.c` | All AT handlers; `f_uwbstart`, timing overrides, command table |
+| `Components/APP/user_out.c` | TWR distance callback; `Tag_Addr:` PDOA output; **`rngOffset_mm` application** |
+| `Components/APP/cmd_fn.c` | All AT handlers; `f_uwbstart`, timing overrides, command table; **`rngOffset_mm` on `AT+DISTANCE`** |
 | `Components/APP/Generic_cmd.c` | UART/USB command routing; binary upload after `AT+UWBDATA` header |
-| `Components/APP/user_out.c` | TWR distance callback; `Tag_Addr:` PDOA output |
 | `Components/APP/tag_bootstrap.c` | Slot scheduler bootstrap; poll dest sync; TWR timing sync |
 | `Components/APP/uwb_status.c` | IRQ wrap, `SYS_STATUS` bits, RX frame capture |
 | `Components/APP/uwb_pdoa.c` | PDOA config, STS apply, angle conversion |
@@ -199,7 +210,7 @@ Factory defaults are too tight for GCC port latency. Applied in `f_uwbstart()` t
 | V1.0.37 | Final dest patch; timing sync |
 | V1.0.40–42 | SPI fast-mode restore; full debug suppress |
 | V1.0.46 | **TWR + PDOA working**; `uwb_pdoa.c`; anchor distance stream |
-| **V1.0.47** | **`AT+UWBDATA`**; extended PHR; `uwb_data.c` |
+| **V1.0.47** | **`AT+UWBDATA`**; extended PHR; `uwb_data.c`; **`rngOffset_mm` applied to reported range** |
 
 Full debugging timeline: `../Refs/BU04_firmware_work_summary.md`
 
@@ -210,15 +221,16 @@ Full debugging timeline: `../Refs/BU04_firmware_work_summary.md`
 | Field | Meaning |
 |-------|---------|
 | `cb` | Completed TWR exchanges — **0 = no range yet** |
-| `l13` | 13-byte Poll frames received (anchor) |
+| `rxg` | RX frames with good CRC (anchor diag) |
 | `rlen:21`, `b9:27` | Response received (tag) |
 | `rlen:110` | STS Final received (anchor) |
 | `txf` | Delayed TX failures — should stay 0 |
 | `pdor` | Latched PDOA raw (non-zero = PDOA working) |
 | `send resp fault` | Anchor Response TX failed — should be ≈0 |
+| `l13`, `rlen`, `rh` | **Always 0** — `uwb_snapshot_rx_meta()` not wired; ignore |
 
-**Success (TWR):** anchor `AT+DISTANCE` non-zero; anchor `l13` rising; tag `rlen:21`.  
-**Success (PDOA):** `Tag_Addr:` with non-zero `Angle` and `Range:1.xxx`.  
+**Success (TWR):** anchor `AT+DISTANCE` non-zero; anchor `rxg` rising; tag `rlen:21`.  
+**Success (PDOA):** `Tag_Addr:` with non-zero `Angle` and calibrated `Range` (e.g. `Range:1.580` at 1.58 m).  
 **Success (data):** `+UWBDATA` on peer within ~5–20 s of send.
 
 ---
@@ -227,4 +239,3 @@ Full debugging timeline: `../Refs/BU04_firmware_work_summary.md`
 
 - Project workflow: [`../Refs/BU04_project_guide.md`](../Refs/BU04_project_guide.md)
 - AT commands: [`../Refs/BU03_BU04_AT_commands.md`](../Refs/BU03_BU04_AT_commands.md)
-- TWR / PDOA / UWBDATA notes: [`../Refs/BU04_*_achievements.md`](../Refs/)

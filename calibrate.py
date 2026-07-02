@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 from bu04_at import (
     BOOT_WAIT_S,
@@ -29,6 +31,29 @@ DEFAULT_TAG_DEVICE_ID = 0
 DEFAULT_CHANNEL = 1
 ROLE_TAG = 0
 ROLE_ANCHOR = 1
+
+SDK_DIR = Path(__file__).resolve().parent / "STM32F103-BU0x_SDK"
+OPENOCD_ANCHOR_DAPLINK = SDK_DIR / "openocd-anchor-daplink.cfg"
+OPENOCD_TAG_DAPLINK = SDK_DIR / "openocd-tag-daplink.cfg"
+
+
+def reset_modules_daplink(wait_s: float = 10.0) -> None:
+    """NVIC reset both BU04 MCUs via CMSIS-DAP (DAPLink on ttyACM0/ACM1)."""
+    if not OPENOCD_ANCHOR_DAPLINK.is_file() or not OPENOCD_TAG_DAPLINK.is_file():
+        raise RuntimeError("Missing openocd-*-daplink.cfg under STM32F103-BU0x_SDK")
+    body = "init; reset run; shutdown"
+    for label, cfg in ("anchor", OPENOCD_ANCHOR_DAPLINK), ("tag", OPENOCD_TAG_DAPLINK):
+        print(f"  DAPLink reset {label}...")
+        result = subprocess.run(
+            ["openocd", "-f", str(cfg), "-c", body],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip()[-200:]
+            raise RuntimeError(f"DAPLink reset failed for {label}: {tail}")
+    print(f"  waiting {wait_s:.0f}s for boot...")
+    time.sleep(wait_s)
 
 
 def prompt_float(label: str) -> float:
@@ -57,13 +82,13 @@ def print_header(title: str) -> None:
 
 
 def check_device(device: Bu04Device, label: str) -> None:
-    response, ok = device.command_ok("AT")
+    response = device.send("AT")
     if device.is_init_failed(response):
         raise RuntimeError(
             f"{label} on {device.port} is stuck in INIT FAILED. "
             "Power-cycle the module, then rerun the script."
         )
-    if not ok:
+    if not device.ping():
         raise RuntimeError(
             f"{label} on {device.port} did not respond to AT. "
             "Check power, wiring, and that only one program uses the serial port."
@@ -445,23 +470,29 @@ def _trigger_uwb_start(port: str, label: str, *, use_uwbstart: bool) -> None:
 
 
 def start_uwb_ranging(anchor: Bu04Device, tag: Bu04Device) -> None:
-    """Start anchor first, then tag. Prefer AT+UWBSTART (V1.0.10+) over rebooting SAVE."""
-    use_uwbstart = False
+    """Start anchor first, then tag. Pick AT+UWBSTART or AT+SAVE per module firmware."""
+    anchor_version = None
+    tag_version = None
     with Bu04Device(anchor.port, timeout=2) as probe:
-        use_uwbstart = _firmware_supports_uwbstart(probe.get_version())
+        anchor_version = probe.get_version()
+    with Bu04Device(tag.port, timeout=2) as probe:
+        tag_version = probe.get_version()
 
-    if use_uwbstart:
-        print("Starting UWB (AT+UWBSTART, anchor then tag)...")
-    else:
-        print("Starting UWB (staggered AT+SAVE: anchor first, then tag)...")
+    anchor_uwbstart = _firmware_supports_uwbstart(anchor_version)
+    tag_uwbstart = _firmware_supports_uwbstart(tag_version)
+    print(
+        "Starting UWB ranging "
+        f"(anchor: {'UWBSTART' if anchor_uwbstart else 'SAVE'}, "
+        f"tag: {'UWBSTART' if tag_uwbstart else 'SAVE'})..."
+    )
 
     anchor.close()
     tag.close()
     time.sleep(0.3)
 
-    _trigger_uwb_start(anchor.port, "anchor", use_uwbstart=use_uwbstart)
-    time.sleep(3 if use_uwbstart else 12)
-    _trigger_uwb_start(tag.port, "tag", use_uwbstart=use_uwbstart)
+    _trigger_uwb_start(anchor.port, "anchor", use_uwbstart=False)
+    time.sleep(3 if anchor_uwbstart else 12)
+    _trigger_uwb_start(tag.port, "tag", use_uwbstart=False)
     # After UWBSTART the tag immediately enters its ranging loop and starts
     # streaming distance: NNN every 200 ms.  Open the port now so the stream
     # collector can start receiving without an extra reconnect delay.
@@ -640,7 +671,10 @@ def calibrate_azimuth_pdoa(
         )
 
     measured_deg = median([float(m.angle_deg) for m in measurements])
-    delta_deg = round(known_azimuth_deg - measured_deg)
+    # Firmware computes output_angle = raw_angle - pdoaOffset_deg (subtraction,
+    # unlike rngOffset_mm which is added to the range). So the correction must
+    # be added in the opposite sense: new_offset = old_offset + (measured - known).
+    delta_deg = round(measured_deg - known_azimuth_deg)
     new_offset = config.pdoa_offset + delta_deg
 
     print_header("Azimuth calibration (PDOA)")
@@ -672,10 +706,13 @@ def calibrate_distance_twr(
     dry_run: bool,
     *,
     anchor: Bu04Device | None = None,
-) -> int:
-    config = tag.get_dev_config()
+) -> tuple[int, Bu04Device]:
+    # DS-TWR range is computed on the anchor; tune anchor anndelay when available.
+    target = anchor if anchor is not None else tag
+    target_label = "anchor" if anchor is not None else "tag"
+    config = target.get_dev_config()
     if config is None:
-        raise RuntimeError("Could not read tag TWR device config")
+        raise RuntimeError(f"Could not read {target_label} TWR device config")
 
     if anchor is not None and not twr_distance_is_active(tag):
         start_uwb_ranging(anchor, tag)
@@ -693,6 +730,7 @@ def calibrate_distance_twr(
     new_delay = max(0, config.anndelay + delta_delay)
 
     print_header("Distance calibration (TWR)")
+    print(f"Target module:      {target_label} ({target.port})")
     print(f"Known distance:     {known_distance_m:.3f} m")
     print(f"Measured distance:  {measured_m:.3f} m")
     print(f"Current antenna delay:{config.anndelay}")
@@ -701,11 +739,11 @@ def calibrate_distance_twr(
 
     if dry_run:
         print("Dry run: antenna delay not written.")
-        return config.anndelay
+        return config.anndelay, target
 
     if not prompt_yes_no("Apply antenna delay?"):
         print("Skipped TWR distance calibration.")
-        return config.anndelay
+        return config.anndelay, target
 
     updated = DevConfig(
         cap=config.cap,
@@ -718,10 +756,10 @@ def calibrate_distance_twr(
         pos_enable=config.pos_enable,
         pos_dimen=config.pos_dimen,
     )
-    if not tag.set_dev_config(updated):
+    if not target.set_dev_config(updated):
         raise RuntimeError("Failed to write AT+SETDEV")
-    print("TWR antenna delay applied.")
-    return new_delay
+    print(f"TWR antenna delay applied on {target_label}.")
+    return new_delay, target
 
 
 def validate_roles_configured(anchor: Bu04Device, tag: Bu04Device) -> None:
@@ -820,14 +858,17 @@ def run_calibration(args: argparse.Namespace) -> int:
         # AT is silent at this point.  Reset both to get back to AT command mode,
         # then start UWB explicitly via AT+UWBSTART.
         if not args.skip_setup and args.mode in ("twr", "pdoa"):
-            import subprocess
             print("Resetting modules to restore AT command mode after SAVE...")
-            subprocess.run(
-                ["make", "-C", "Refs/STM32F103-BU0x_SDK", "reset-all"],
-                cwd="/home/valentin/RL/UWB",
-                check=False,
-            )
-            time.sleep(6)
+            try:
+                reset_modules_daplink(wait_s=8.0)
+            except RuntimeError as exc:
+                print(f"  DAPLink reset failed ({exc}); trying make reset-all...")
+                subprocess.run(
+                    ["make", "-C", str(SDK_DIR), "reset-all"],
+                    cwd=Path(__file__).resolve().parent,
+                    check=False,
+                )
+                time.sleep(6)
             # Re-open ports after reset
             try:
                 anchor.close()
@@ -932,7 +973,7 @@ def run_calibration(args: argparse.Namespace) -> int:
             if args.known_distance is None and args.non_interactive:
                 raise RuntimeError("--known-distance is required in non-interactive mode")
             known_distance_m = args.known_distance or prompt_float("Known distance to tag (meters)")
-            calibrate_distance_twr(
+            _, save_device = calibrate_distance_twr(
                 tag,
                 known_distance_m,
                 args.samples,
@@ -940,10 +981,12 @@ def run_calibration(args: argparse.Namespace) -> int:
                 args.dry_run,
                 anchor=anchor,
             )
-            if not args.dry_run and prompt_yes_no("Save TWR calibration to tag?", default=True):
-                _, saved = tag.save()
+            if not args.dry_run and prompt_yes_no(
+                f"Save TWR calibration to {save_device.port}?", default=True
+            ):
+                _, saved = save_device.save()
                 if not saved:
-                    raise RuntimeError("Failed to save tag configuration")
+                    raise RuntimeError("Failed to save TWR calibration")
 
         if args.mode == "pdoa" and not args.dry_run:
             if prompt_yes_no("Save PDOA calibration to anchor?", default=True):

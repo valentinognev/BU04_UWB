@@ -123,8 +123,8 @@ Antenna delay calibration (`anndelay`) is the primary knob for correcting TWR di
 | `AT+GETKLIST` | Get the pairing list of registered tags. |
 | `AT+ADDTAG=<params>` | Add a tag to the pairing list. Example: `AT+ADDTAG=0,0,1,1,0` |
 | `AT+DELTAG=<id>` | Remove a tag from the pairing list. Example: `AT+DELTAG=000000004E818834` |
-| `AT+PDOAOFF=<value>` | Set angle correction offset (tenths of degrees). |
-| `AT+RNGOFF=<value>` | Set distance correction offset (millimeters). |
+| `AT+PDOAOFF=<value>` | Set azimuth calibration offset (**integer degrees**). Subtracted from raw angle in `Tag_Addr:` output. |
+| `AT+RNGOFF=<value>` | Set range calibration offset (**millimeters**). Added to raw range in `Tag_Addr:` and `AT+DISTANCE`. |
 | `AT+FILTER=<value>` | Enable/disable filtering. `0` recommended for calibration. |
 | `AT+UARTRATE=<value>` | Set serial port baud rate. Example: `AT+UARTRATE=100` |
 | `AT+USER_CMD=<value>` | Set output data format. **`1`** enables anchor `Tag_Addr:` stream. |
@@ -143,9 +143,19 @@ Network **4369** = PAN `0x1111`. Tag `anc_id=0` must match anchor device id.
 ### `AT+PDOAGETCFG` response (custom firmware)
 
 ```
-Dlist:0 KList:1 Net:1111 AncID:0 Rate:100 Filter:0 UserCmd:1
-pdoaOffset:0 rngOffset:0
+getcfg Dlist:1 KList:1 Net:1111 AncID:0 Rate:100 Filter:0 UserCmd:1 pdoaOffset:103 rngOffset:-760
 ```
+
+Offsets persist in NVM after `AT+SAVE`. Host tools (`bu04_at.py`) must wait for the **full line** (including `pdoaOffset` and `rngOffset`) before treating the response as complete — partial `Dlist:` fragments are common when interleaved with `Tag_Addr:` stream output.
+
+### Calibration offset semantics
+
+| Command | Unit | Firmware formula | Example (1.58 m, head-on) |
+|---------|------|------------------|---------------------------|
+| `AT+RNGOFF` | mm | `reported_mm = raw_mm + rngOffset_mm` | Raw ~2340 mm → offset **-760** → **1580 mm** |
+| `AT+PDOAOFF` | degrees | `reported_deg = raw_deg - pdoaOffset_deg` | Raw ~103° → offset **103** → **~0°** |
+
+`calibrate.py` computes: `new_rng_offset = old + round((known_m - measured_m) * 1000)` and `new_pdoa_offset = old + round(measured_deg - known_deg)` (note the **opposite sign** from range, matching the subtract convention in firmware).
 
 ### PDOA measurement stream (`AT+USER_CMD=1`)
 
@@ -360,5 +370,3 @@ Or use `calibrate.py` / `test_uwbdata.py --setup` from the repo root.
 |----------|---------|
 | [`BU04_project_guide.md`](BU04_project_guide.md) | Full project workflow |
 | [`../STM32F103-BU0x_SDK/FIRMWARE.md`](../STM32F103-BU0x_SDK/FIRMWARE.md) | Firmware architecture |
-| [`BU04_uwbdata_achievements.md`](BU04_uwbdata_achievements.md) | UWBDATA design notes |
-| [`BU04_pdoa_achievements.md`](BU04_pdoa_achievements.md) | PDOA setup and calibration |

@@ -3,7 +3,8 @@
 This repository controls two **Ai-Thinker BU04** UWB modules (STM32F103 + Qorvo DW3000) for **two-way ranging (TWR)**, **phase-difference-of-arrival (PDOA) azimuth**, and **peer-to-peer UWB data transfer**. Host control is over **115200 baud UART** (FT4232H on the dev board); firmware is a custom **GCC port** of the Ai-Thinker SDK.
 
 **Current custom firmware:** `V1.0.47` (`STM32F103-BU0x_SDK/`)  
-**Typical ports:** anchor `/dev/ttyUSB0`, tag `/dev/ttyUSB4`
+**Typical ports:** anchor `/dev/ttyUSB0`, tag `/dev/ttyUSB4` (FT4232H)  
+**Current lab setup:** anchor `/dev/ttyACM0`, tag `/dev/ttyACM1` (DAPLink CMSIS-DAP on each module)
 
 ---
 
@@ -11,8 +12,9 @@ This repository controls two **Ai-Thinker BU04** UWB modules (STM32F103 + Qorvo 
 
 | Capability | Status | How to read results |
 |------------|--------|---------------------|
-| **TWR distance** | Working | Anchor `AT+DISTANCE` or `distance:` UART stream (~mm; ~590 mm bias at 1 m before calibration) |
+| **TWR distance** | Working | Anchor `AT+DISTANCE` or `distance:` UART stream (mm) |
 | **PDOA range + angle** | Working | Anchor `Tag_Addr:` lines (`Angle` in tenths of degrees) |
+| **PDOA calibration** | Verified @ 1.58 m | `rngOffset=-760 mm`, `pdoaOffset=103°` → median **1.58 m**, **~0°** head-on |
 | **UWB data channel** | Implemented (V1.0.47+) | `AT+UWBDATA` send → peer `+UWBDATA` receive; run `test_uwbdata.py` to verify on hardware |
 
 All three build on the same vendor TWR stack (`AT+SETUWBMODE=0`, precompiled `node.o` / `tag.o`), not the isolated `SETUWBMODE=1` example code.
@@ -25,14 +27,25 @@ Two BU04 modules, each with:
 
 - **ST-Link** (SWD) for flash/debug
 - **FT4232H UART port A** for AT commands (115200) — use FTDI serial, **not** ST-Link VCP
+- **DAPLink** (optional) — CMSIS-DAP + USB serial on `/dev/ttyACM0` / `/dev/ttyACM1`
 - **External power** on both modules (required for reliable DW3000 SPI)
 
-| Module | Typical UART | Role |
-|--------|--------------|------|
-| Anchor | `/dev/ttyUSB0` | `role=1`, computes range (and PDOA on anchor) |
-| Tag | `/dev/ttyUSB4` | `role=0`, initiates TWR Poll |
+| Module | Typical UART | DAPLink (this lab) | Role |
+|--------|--------------|--------------------|------|
+| Anchor | `/dev/ttyUSB0` | `/dev/ttyACM0` | `role=1`, computes range (and PDOA on anchor) |
+| Tag | `/dev/ttyUSB4` | `/dev/ttyACM1` | `role=0`, initiates TWR Poll |
 
-Modules should face each other at ~0.5–2 m with ring antennas aligned. After every full flash, NVM is erased — **reconfigure roles** before ranging.
+Modules should face each other at ~0.5–2 m with **fronts toward each other** (antenna boresight). Back-to-back orientation gives large bogus azimuth offsets. After every full flash, NVM is erased — **reconfigure roles** before ranging.
+
+**DAPLink flash / reset** (when ST-Link USB paths are unavailable):
+
+```bash
+cd STM32F103-BU0x_SDK
+openocd -f openocd-anchor-daplink.cfg -c "init; reset run; shutdown"
+openocd -f openocd-tag-daplink.cfg    -c "init; reset run; shutdown"
+# Full flash (erases NVM):
+openocd -f openocd-anchor-daplink.cfg -c "init; reset halt; flash erase_address 0x08000000 0x20000; flash write_image build/bu04_firmware.bin 0x08000000; reset run; shutdown"
+```
 
 ---
 
@@ -44,15 +57,14 @@ UWB/
 ├── calibrate.py            # Two-module setup, TWR/PDOA calibration
 ├── test_connection.py      # AT smoke test
 ├── test_uwbdata.py         # AT+UWBDATA link test (V1.0.47+)
-├── calibrate.py
 ├── Refs/                   # Vendor PDFs, hex, and project notes
 │   ├── BU03_BU04_AT_commands.md
 │   ├── BU04_project_guide.md          ← this file
-│   ├── BU04_distance_achievements.md
-│   ├── BU04_pdoa_achievements.md
-│   └── BU04_uwbdata_achievements.md
+│   └── BU04-kit.pdf
 └── STM32F103-BU0x_SDK/     # Custom GCC firmware (nested git repo)
     ├── FIRMWARE.md         # Firmware architecture & build details
+    ├── openocd-anchor-daplink.cfg
+    ├── openocd-tag-daplink.cfg
     ├── Makefile            # build, flash, binary patches
     └── Components/         # APP + HAL sources
 ```
@@ -94,17 +106,19 @@ python3 calibrate.py --anchor /dev/ttyUSB0 --tag /dev/ttyUSB4 \
 **PDOA (distance + azimuth):**
 
 ```bash
-python3 calibrate.py --anchor /dev/ttyUSB0 --tag /dev/ttyUSB4 \
-  --non-interactive --mode pdoa --known-distance 1.0 --known-azimuth 0 \
-  --samples 10 --dry-run --force-setup
+python3 calibrate.py --anchor /dev/ttyACM0 --tag /dev/ttyACM1 \
+  --non-interactive --mode pdoa --known-distance 1.58 --known-azimuth 0 \
+  --samples 60 --sample-time 30 --dry-run --force-setup
 ```
+
+Use `--non-interactive` whenever passing `--known-distance` / `--known-azimuth` on the command line (otherwise the script prompts interactively).
 
 **Apply calibration (writes offsets to NVM):**
 
 ```bash
-python3 calibrate.py --anchor /dev/ttyUSB0 --tag /dev/ttyUSB4 \
-  --non-interactive --mode pdoa --known-distance 1.0 --known-azimuth 0 \
-  --samples 10 --force-setup
+python3 calibrate.py --anchor /dev/ttyACM0 --tag /dev/ttyACM1 \
+  --non-interactive --mode pdoa --known-distance 1.58 --known-azimuth 0 \
+  --samples 60 --sample-time 30 --force-setup
 ```
 
 **UWB data transfer test (after ranging works):**
@@ -193,6 +207,8 @@ Dependencies: `pip install pyserial`
 6. **`AT+SETCFG` channel param:** `ch=1` means RF **channel 5**, not literal channel 1.
 7. **Build with `make -j1`** — parallel builds can race Keil object patches.
 8. **External power** on both modules — without it, `DEVID:0xFFFFFFFF` on `AT+UWBSTART`.
+9. **PDOA orientation** — modules must face **front-to-front** (antenna boresight). Back-to-back gives large bogus azimuth.
+10. **`calibrate.py --non-interactive`** — required when passing `--known-distance` / `--known-azimuth` on the CLI.
 
 ---
 
@@ -212,11 +228,17 @@ Custom firmware adds GCC build, OpenOCD flash, SPI/UART fixes, binary patches to
 
 ## Calibration Notes
 
-At ~1 m physical separation, uncorrected readings are typically **~1.57–1.76 m** (~590–760 mm bias). Run `calibrate.py` without `--dry-run` to write:
+At ~1 m physical separation, uncorrected PDOA range is typically **~1.57–2.37 m** (~590–760 mm bias). At **1.58 m** with fronts facing, verified offsets are **`rngOffset=-760 mm`**, **`pdoaOffset=103°`**, yielding median **1.58 m** range and **~0°** azimuth.
 
-- **TWR / distance:** antenna delay via `AT+SETDEV` (`anndelay`)
-- **PDOA distance:** `AT+RNGOFF`
-- **PDOA azimuth:** `AT+PDOAOFF` (place tag at known bearing)
+| Calibration | AT command | Firmware applies as |
+|-------------|------------|---------------------|
+| PDOA distance | `AT+RNGOFF` (mm) | `reported_range = raw_range + rngOffset_mm` |
+| PDOA azimuth | `AT+PDOAOFF` (degrees) | `reported_angle = raw_angle - pdoaOffset_deg` |
+| TWR distance | `AT+SETDEV` (`anndelay`) | Antenna delay in TWR stack |
+
+**Important:** `calibrate.py` azimuth math must match the subtract convention above (`new_offset = old_offset + (measured - known)`). Angles are noisy before calibration (±10–20° spread is normal); use 30–60 s sample windows.
+
+After `make flash-all` or DAPLink full flash, NVM is erased — rerun `calibrate.py --force-setup` or the manual AT sequence below.
 
 ---
 
@@ -225,11 +247,7 @@ At ~1 m physical separation, uncorrected readings are typically **~1.57–1.76 m
 | Document | Content |
 |----------|---------|
 | [`BU03_BU04_AT_commands.md`](BU03_BU04_AT_commands.md) | Full AT command reference (vendor + custom extensions) |
-| [`BU04_distance_achievements.md`](BU04_distance_achievements.md) | TWR milestone, diagnostics, timing fixes |
-| [`BU04_pdoa_achievements.md`](BU04_pdoa_achievements.md) | PDOA setup, `Tag_Addr` format, angle math |
-| [`BU04_uwbdata_achievements.md`](BU04_uwbdata_achievements.md) | `AT+UWBDATA` protocol and firmware design |
-| [`../STM32F103-BU0x_SDK/FIRMWARE.md`](../STM32F103-BU0x_SDK/FIRMWARE.md) | Firmware build, patches, source map |
-| `BU04_firmware_work_summary.md` | Long debugging history (handoff notes) |
+| [`../STM32F103-BU0x_SDK/FIRMWARE.md`](../STM32F103-BU0x_SDK/FIRMWARE.md) | Firmware build, patches, calibration offset application, source map |
 
 Vendor PDF: `Refs/BU03_BU04_AT_command_en_v1.0.6.pdf`  
 Factory hex (reference only): `Refs/（2717）BU03_BU04-AT-通用-常规固件V1.0.0_T2024-07-26.hex`

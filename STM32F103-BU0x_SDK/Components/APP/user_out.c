@@ -30,6 +30,17 @@ bool get_aiio_output_state (void)
     return aiio_output;
 }
 
+/* AT+RNGOFF stores rngOffset_mm in NVM but nothing previously consumed it -
+ * apply it here so AT+DISTANCE and the Tag_Addr: stream both reflect the
+ * calibrated range instead of the raw TWR measurement. */
+static int user_out_apply_rng_offset_cm(int dist_cm)
+{
+    int16_t offset_mm = (app.pConfig != NULL) ? app.pConfig->s.s_pdoa.rngOffset_mm : 0;
+    float corrected = (float) dist_cm + ((float) offset_mm / 10.0f);
+    int corrected_cm = (int) (corrected + ((corrected >= 0.0f) ? 0.5f : -0.5f));
+    return (corrected_cm < 0) ? 0 : corrected_cm;
+}
+
 static int16_t user_out_pick_pdoa_raw(void)
 {
     if (uwb_poll_pdoa_raw != 0)
@@ -64,7 +75,7 @@ static void user_out_fill_pdoa_result(result_pdoa_t *out, uint16_t addr16, uint8
     memset(out, 0, sizeof(*out));
     out->addr16 = addr16;
     out->rangeNum = range_num;
-    out->dist_cm = (float) dist_cm;
+    out->dist_cm = (float) user_out_apply_rng_offset_cm(dist_cm);
 
     angle_deg_x10 = uwb_pdoa_raw_to_deg_x10(raw);
     angle_deg_x10 = (int16_t) (angle_deg_x10 - (int16_t) (app.pConfig->s.s_pdoa.pdoaOffset_deg * 10));
@@ -86,7 +97,7 @@ static void user_out_fill_pdoa_result(result_pdoa_t *out, uint16_t addr16, uint8
 
     if (out->x_cm == 0.0f && out->y_cm == 0.0f)
     {
-        uwb_pdoa_polar_to_xy_cm(dist_cm, angle_deg_x10, &x_cm, &y_cm);
+        uwb_pdoa_polar_to_xy_cm((int) out->dist_cm, angle_deg_x10, &x_cm, &y_cm);
         out->x_cm = (float) x_cm;
         out->y_cm = (float) y_cm;
     }
